@@ -1,13 +1,11 @@
 import uvicorn
 from fastapi import FastAPI
 
-app = FastAPI()
+from market_pipeline.api import create_app
+from market_pipeline.model import PipelineConfig
 
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app(PipelineConfig(data_dir="./data"))
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=0)
+    uvicorn.run(app, host="127.0.0.1", port=8000)
