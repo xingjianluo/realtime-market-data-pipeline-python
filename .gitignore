@@ -7,3 +7,6 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地存储模拟数据（运行时生成）
+data/
