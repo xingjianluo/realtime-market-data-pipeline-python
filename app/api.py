@@ -1,19 +1,21 @@
 """FastAPI HTTP 接入层。
 
 路由：
-- GET  /health                         健康检查与当前水位线；
+- GET  /health                         健康检查、当前水位线与服务级总容量占用；
 - POST /events                         提交单条行情（原始 JSON 透传，便于暴露结构错误）；
 - POST /events/batch                   批量提交；
 - GET  /aggregates                     查询窗口聚合（可按 symbol 过滤）；
 - GET  /dead-letters                   查询被拒绝事件及可区分原因；
-- POST /dead-letters/{event_id}/redeliver  重新投递死信；
+- POST /dead-letters/{event_id}/redeliver  重新投递死信（可用 ?source= 消除跨来源歧义）；
 - POST /windows/close                  显式关闭已到期窗口；
-- GET  /offsets                        查询各来源消费位点。
+- GET  /offsets                        查询各来源消费位点；
+- GET  /capacity                       查询服务级总闸占用与剩余额度。
 """
 
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from typing import Any
 
 from fastapi import Body, FastAPI
@@ -24,10 +26,18 @@ from app.models import EventStatus
 from app.pipeline import Pipeline
 
 
+def _decimal(value: Decimal | None) -> str | None:
+    """金额口径输出：精确十进制字符串，不转回 float，杜绝展示端漂移。"""
+    if value is None:
+        return None
+    return format(value, "f")
+
+
 def _result_to_dict(result: Any) -> dict:
     return {
         "status": result.status.value,
         "event_id": result.event_id,
+        "source": result.source,
         "reason": result.reason.value if result.reason else None,
         "detail": result.detail,
         "window_start_ms": result.window_start_ms,
@@ -41,14 +51,16 @@ def _aggregate_to_dict(agg: Any) -> dict:
         "window_end_ms": agg.window_end_ms,
         "closed": agg.closed,
         "count": agg.count,
-        "total_quantity": agg.total_quantity,
-        "notional": round(agg.notional, 12),
-        "min_price": agg.min_price,
-        "max_price": agg.max_price,
-        "first_price": agg.first_price,
-        "last_price": agg.last_price,
+        "total_quantity": _decimal(agg.total_quantity),
+        "notional": _decimal(agg.notional),
+        "avg_price": _decimal(agg.avg_price),
+        "min_price": _decimal(agg.min_price),
+        "max_price": _decimal(agg.max_price),
+        "first_price": _decimal(agg.first_price),
+        "last_price": _decimal(agg.last_price),
         "sources": sorted(agg.sources),
         "event_ids": list(agg.event_ids),
+        "event_refs": list(agg.event_refs),
     }
 
 
@@ -61,7 +73,8 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok", "watermark_ms": pipe.watermark(),
-                "windows": len(pipe.aggregates())}
+                "windows": len(pipe.aggregates()),
+                "capacity": pipe.capacity()}
 
     @app.post("/events")
     def submit_event(payload: dict) -> dict:
@@ -89,8 +102,8 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
         return {"dead_letters": pipe.dead_letters()}
 
     @app.post("/dead-letters/{event_id}/redeliver")
-    def redeliver(event_id: str) -> dict:
-        result = pipe.redeliver(event_id)
+    def redeliver(event_id: str, source: str = "") -> dict:
+        result = pipe.redeliver(event_id, source=source)
         status_code = 200 if result.status != EventStatus.REJECTED else 422
         return JSONResponse(status_code=status_code, content=_result_to_dict(result))
 
@@ -102,5 +115,9 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     @app.get("/offsets")
     def get_offsets() -> dict:
         return {"offsets": pipe.offsets()}
+
+    @app.get("/capacity")
+    def get_capacity() -> dict:
+        return pipe.capacity()
 
     return app

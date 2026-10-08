@@ -59,6 +59,12 @@ def test_submit_duplicate_and_aggregate_flow(client):
     assert len(dls) == 1 and dls[0]["reason"] == "TYPE_MISMATCH"
     assert client.get("/health").json()["watermark_ms"] == 1500 - 1000
     assert client.get("/offsets").json()["offsets"] == {"SRC-A": 1}
+    # 服务级总闸视图：已受理 1 条，额度信息完整（新能力不影响既有流程）
+    cap = client.get("/capacity").json()
+    assert cap["accepted"] == 1 and cap["limit"] is not None
+    assert cap["remaining"] == cap["limit"] - 1
+    # 提交结果携带来源字段（多来源语义在 HTTP 层可见）
+    assert r1.json()["source"] == "SRC-A"
 
 
 def test_batch_and_window_close_and_redeliver(client):

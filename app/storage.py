@@ -136,11 +136,23 @@ class LocalStorage:
                     records.append(json.loads(line))
         return records
 
-    def remove_dead_letter(self, event_id: str) -> None:
+    def remove_dead_letter(self, event_id: str, source: str = "") -> None:
+        """移除死信条目；多来源编号撞号时用 source 精确定位。
+
+        source 为空串时退化为仅按 event_id 匹配（兼容旧死信记录无 source）。
+        """
         path = self.data_dir / self.DEAD_NAME
         if not path.exists():
             return
-        kept = [r for r in self.load_dead_letters() if r.get("event_id") != event_id]
+
+        def _match(rec: dict[str, Any]) -> bool:
+            if rec.get("event_id") != event_id:
+                return False
+            if source == "":
+                return True
+            return rec.get("source", "") == source
+
+        kept = [r for r in self.load_dead_letters() if not _match(r)]
         tmp = self.data_dir / (self.DEAD_NAME + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             for r in kept:
