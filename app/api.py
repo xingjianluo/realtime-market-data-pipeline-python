@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from typing import Any
 
 from fastapi import Body, FastAPI
@@ -22,6 +23,14 @@ from fastapi.responses import JSONResponse
 from app.config import Config
 from app.models import EventStatus
 from app.pipeline import Pipeline
+from app.storage import dumps as json_dumps
+
+
+class DecimalJSONResponse(JSONResponse):
+    """金额字段（Decimal）按精确十进制数字输出，不经过 float。"""
+
+    def render(self, content: Any) -> bytes:
+        return json_dumps(content).encode("utf-8")
 
 
 def _result_to_dict(result: Any) -> dict:
@@ -34,6 +43,11 @@ def _result_to_dict(result: Any) -> dict:
     }
 
 
+def _num(value: Decimal | None) -> str | None:
+    """聚合金额按**精确十进制字面量**输出（如 0.30、19.99），不做 float 舍入。"""
+    return None if value is None else format(value, "f")
+
+
 def _aggregate_to_dict(agg: Any) -> dict:
     return {
         "symbol": agg.symbol,
@@ -41,12 +55,13 @@ def _aggregate_to_dict(agg: Any) -> dict:
         "window_end_ms": agg.window_end_ms,
         "closed": agg.closed,
         "count": agg.count,
-        "total_quantity": agg.total_quantity,
-        "notional": round(agg.notional, 12),
-        "min_price": agg.min_price,
-        "max_price": agg.max_price,
-        "first_price": agg.first_price,
-        "last_price": agg.last_price,
+        "total_quantity": _num(agg.total_quantity),
+        "notional": _num(agg.notional),
+        "avg_price": _num(agg.avg_price),
+        "min_price": _num(agg.min_price),
+        "max_price": _num(agg.max_price),
+        "first_price": _num(agg.first_price),
+        "last_price": _num(agg.last_price),
         "sources": sorted(agg.sources),
         "event_ids": list(agg.event_ids),
     }
@@ -61,46 +76,56 @@ def create_app(pipeline: Pipeline | None = None) -> FastAPI:
     @app.get("/health")
     def health() -> dict:
         return {"status": "ok", "watermark_ms": pipe.watermark(),
-                "windows": len(pipe.aggregates())}
+                "windows": len(pipe.aggregates()), **pipe.quota()}
 
     @app.post("/events")
     def submit_event(payload: dict) -> dict:
         result = pipe.submit(payload)
         status_code = 200 if result.status != EventStatus.REJECTED else 422
-        return JSONResponse(status_code=status_code, content=_result_to_dict(result))
+        return DecimalJSONResponse(status_code=status_code,
+                                   content=_result_to_dict(result))
 
     @app.post("/events/batch")
-    def submit_batch(payload: list = Body(...)) -> dict:
+    def submit_batch(payload: list = Body(...)):
         results = pipe.submit_batch(payload)
         rejected = sum(1 for r in results if r.status == EventStatus.REJECTED)
         status_code = 200 if rejected == 0 else 422
-        return JSONResponse(status_code=status_code,
-                            content={"results": [_result_to_dict(r) for r in results]})
+        return DecimalJSONResponse(
+            status_code=status_code,
+            content={"results": [_result_to_dict(r) for r in results]})
 
     @app.get("/aggregates")
-    def get_aggregates(symbol: str | None = None) -> dict:
+    def get_aggregates(symbol: str | None = None):
         items = pipe.aggregates()
         if symbol is not None:
             items = [a for a in items if a.symbol == symbol]
-        return {"aggregates": [_aggregate_to_dict(a) for a in items]}
+        return DecimalJSONResponse(
+            content={"aggregates": [_aggregate_to_dict(a) for a in items]})
 
     @app.get("/dead-letters")
-    def get_dead_letters() -> dict:
-        return {"dead_letters": pipe.dead_letters()}
+    def get_dead_letters():
+        return DecimalJSONResponse(content={"dead_letters": pipe.dead_letters()})
 
     @app.post("/dead-letters/{event_id}/redeliver")
-    def redeliver(event_id: str) -> dict:
-        result = pipe.redeliver(event_id)
+    def redeliver(event_id: str, source: str | None = None):
+        result = pipe.redeliver(event_id, source=source)
         status_code = 200 if result.status != EventStatus.REJECTED else 422
-        return JSONResponse(status_code=status_code, content=_result_to_dict(result))
+        return DecimalJSONResponse(status_code=status_code,
+                                   content=_result_to_dict(result))
 
     @app.post("/windows/close")
-    def close_windows() -> dict:
+    def close_windows():
         closed = pipe.close_expired()
-        return {"closed": [_aggregate_to_dict(a) for a in closed]}
+        return DecimalJSONResponse(
+            content={"closed": [_aggregate_to_dict(a) for a in closed]})
 
     @app.get("/offsets")
     def get_offsets() -> dict:
         return {"offsets": pipe.offsets()}
+
+    @app.get("/quota")
+    def get_quota() -> dict:
+        """服务级总闸用量：跨来源、跨窗口已受理数与上限。"""
+        return pipe.quota()
 
     return app

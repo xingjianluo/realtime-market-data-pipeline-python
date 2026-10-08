@@ -1,19 +1,24 @@
 """核心流水线：结构校验、去重、入窗、持久化、位点推进与拒绝记录重投。
 
 确定性保证：
-- 同一 event_id 的重复提交返回 DUPLICATE，绝不重复计入；
-- event_id 相同但内容不同返回 DUPLICATE_ID_CONFLICT，绝不静默覆盖；
+- 去重只在**同一 source 内部**判定：复合键 (source, event_id) 相同且内容一致
+  返回 DUPLICATE，绝不重复计入；内容不同返回 DUPLICATE_ID_CONFLICT，绝不静默
+  覆盖。不同来源 event_id 撞车是合法情形，各自独立受理、互不覆盖、互不干扰；
 - 乱序事件按 event_time 归入其本来窗口；迟到事件明确拒绝（WINDOW_CLOSED）
   而非静默丢弃，全部拒绝都落死信日志，可通过 /dead-letters/{id}/redeliver 重投；
 - 批量超限整批拒绝（BATCH_TOO_LARGE），单窗满员拒绝（WINDOW_FULL）；
-- 每次接受先写 WAL(fsync)，再更新内存，再原子写快照与位点，重启不丢不重。
+- 服务级总闸：跨来源、跨窗口累计已受理事件数达 max_total_events 后，新事件以
+  SERVICE_FULL 拒绝（与窗口/批量两层原因明确区分）；锁内原子占用，并发不超发；
+- 金额全程 Decimal 精确十进制运算，任意到达顺序、任意重复提交结果一致；
+- 每次接受先写 WAL(fsync)，再更新内存，再原子写快照与位点，重启不丢不重，
+  已占用总额度随快照/WAL 精确恢复。
 """
 
 from __future__ import annotations
 
-import json
 import threading
 import time
+from decimal import Decimal
 from typing import Callable
 
 from app.config import Config
@@ -25,15 +30,18 @@ from app.models import (
     WindowAggregate,
 )
 from app.storage import LocalStorage
+from app.storage import dumps as json_dumps
 from app.windows import WindowManager
 
 # 每个 schema 版本必填/类型固定的字段（新增版本只在此处显式登记）
+# price/quantity 接受 int/float/Decimal（来自 JSON 的 float 会精确转 Decimal，
+# 但 NaN/Inf/非正数仍被拒绝）
 _BASE_FIELDS: dict[str, type | tuple[type, ...]] = {
     "event_id": str,
     "source": str,
     "symbol": str,
-    "price": (int, float),
-    "quantity": (int, float),
+    "price": (int, float, Decimal),
+    "quantity": (int, float, Decimal),
     "event_time_ms": int,
 }
 # 不同版本新增字段：缺省语义稳定
@@ -64,23 +72,31 @@ def _is_nonneg_int(value: object) -> bool:
 
 
 def _is_finite_number(value: object) -> bool:
-    return (isinstance(value, (int, float))
-            and not isinstance(value, bool)
-            and value == value  # NaN 判定
+    if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
+        return False
+    if isinstance(value, Decimal):
+        return value.is_finite()
+    return (value == value  # NaN 判定
             and value not in (float("inf"), float("-inf")))
 
 
+def _to_decimal(value: int | float | Decimal | str) -> Decimal:
+    """把入参金额精确转成 Decimal：经 str 走十进制字面量，杜绝二进制误差。"""
+    if isinstance(value, Decimal):
+        return value
+    return Decimal(str(value))
+
+
 def canonical_payload(event: MarketEvent) -> str:
-    """除 event_id 外字段的规范化内容签名，用于冲突检测。"""
-    return json.dumps({
-        "source": event.source,
+    """除来源内主键外字段的规范化内容签名，用于冲突检测（Decimal 精确序列化）。"""
+    return json_dumps({
         "symbol": event.symbol,
         "price": event.price,
         "quantity": event.quantity,
         "event_time_ms": event.event_time_ms,
         "schema_version": event.schema_version,
         "venue": event.venue,
-    }, sort_keys=True, ensure_ascii=False)
+    })
 
 
 class Pipeline:
@@ -99,8 +115,11 @@ class Pipeline:
             max_events_per_window=self.config.max_events_per_window,
         )
         self._lock = threading.RLock()
-        # event_id -> 已确认事件的规范化内容签名
-        self._dedup: dict[str, str] = {}
+        # (source, event_id) -> 已确认事件的规范化内容签名
+        # 去重只在同一来源内部判定，跨来源 event_id 撞车互不影响
+        self._dedup: dict[tuple[str, str], str] = {}
+        # 服务级总闸：跨来源、跨窗口累计已受理事件数
+        self._total_accepted: int = 0
         # source -> 已确认最大 offset（模拟消费位点）
         self._offsets: dict[str, int] = self.storage.load_offsets()
         self._restore()
@@ -171,8 +190,8 @@ class Pipeline:
             event_id=raw["event_id"],
             source=raw["source"],
             symbol=raw["symbol"],
-            price=float(raw["price"]),
-            quantity=float(raw["quantity"]),
+            price=_to_decimal(raw["price"]),
+            quantity=_to_decimal(raw["quantity"]),
             event_time_ms=raw["event_time_ms"],
             schema_version=version,
             venue=venue,
@@ -192,35 +211,48 @@ class Pipeline:
         except ValidationError as exc:
             return self._reject(raw, exc.event_id, exc.reason, exc.detail)
 
-        # 2) 去重 / 冲突
-        existing = self._dedup.get(event.event_id)
+        # 2) 来源内去重 / 冲突（不同来源 event_id 相同不算重复）
+        existing = self._dedup.get(event.key)
         if existing is not None:
             signature = canonical_payload(event)
             if signature == existing:
                 return SubmitResult(
                     status=EventStatus.DUPLICATE,
                     event_id=event.event_id,
-                    detail="event_id 已确认，内容一致，按重复提交幂等忽略，不重复计入")
+                    detail="(source, event_id) 已确认，内容一致，按重复提交幂等忽略，"
+                           "不重复计入")
             result = self._reject(
                 raw, event.event_id, RejectReason.DUPLICATE_ID_CONFLICT,
-                "event_id 已存在但内容不同，拒绝覆盖以保证已确认聚合不被污染")
+                "同一来源内 event_id 已存在但内容不同，拒绝覆盖以保证已确认聚合"
+                "不被污染", source=event.source)
             return result
 
-        # 3) 入窗（迟到/未来/容量判定）
+        # 3) 服务级总闸：锁内判定并预留额度，保证并发提交绝不超发
+        if self.config.max_total_events > 0 and \
+                self._total_accepted >= self.config.max_total_events:
+            return self._reject(
+                raw, event.event_id, RejectReason.SERVICE_FULL,
+                f"服务已受理事件总数 {self._total_accepted} 达到全局上限 "
+                f"{self.config.max_total_events}（跨来源、跨窗口合计），"
+                f"拒绝以保护总容量", source=event.source)
+
+        # 4) 入窗（迟到/未来/容量判定）
         now_ms = self._clock()
         accepted, reason, detail = self.wm.add_event(event, now_ms)
         if not accepted:
             assert reason is not None
-            return self._reject(raw, event.event_id, reason, detail)
+            return self._reject(raw, event.event_id, reason, detail,
+                                source=event.source)
 
-        # 4) 持久化：WAL -> 内存去重 -> 快照 -> 位点
+        # 5) 持久化：WAL -> 内存去重/总额度 -> 快照 -> 位点
         self.storage.append_wal({
             "event_id": event.event_id,
             "source": event.source,
             "offset": raw.get("offset"),
             "event": self._event_to_dict(event),
         })
-        self._dedup[event.event_id] = canonical_payload(event)
+        self._dedup[event.key] = canonical_payload(event)
+        self._total_accepted += 1
         self._advance_offset(raw, event)
         self._persist_state()
 
@@ -252,10 +284,15 @@ class Pipeline:
     # 死信与重投
     # ------------------------------------------------------------------ #
     def _reject(self, raw: dict, event_id: str | None,
-                reason: RejectReason, detail: str) -> SubmitResult:
+                reason: RejectReason, detail: str,
+                source: str | None = None) -> SubmitResult:
         eid = event_id or (raw.get("event_id") if isinstance(raw, dict) else None) or ""
+        if source is None and isinstance(raw, dict):
+            src = raw.get("source")
+            source = src if isinstance(src, str) else None
         record = {
             "event_id": eid,
+            "source": source,
             "reason": reason.value,
             "detail": detail,
             "raw": raw if isinstance(raw, dict) else {"_non_object": repr(raw)},
@@ -269,19 +306,35 @@ class Pipeline:
         with self._lock:
             return self.storage.load_dead_letters()
 
-    def redeliver(self, event_id: str) -> SubmitResult:
-        """从死信中取出原始记录重新投递；成功或幂等重复后移除死信条目。"""
+    def redeliver(self, event_id: str, source: str | None = None) -> SubmitResult:
+        """从死信中取出原始记录重新投递；成功或幂等重复后移除死信条目。
+
+        多来源下同一 event_id 可能对应多条死信：不传 source 且命中多条时，
+        明确返回可区分的歧义错误，要求调用方指定来源。
+        """
         with self._lock:
-            for rec in self.storage.load_dead_letters():
-                if rec.get("event_id") == event_id:
-                    result = self._submit_locked(rec["raw"])
-                    if result.status in (EventStatus.ACCEPTED, EventStatus.DUPLICATE):
-                        self.storage.remove_dead_letter(event_id)
-                    return result
-            return SubmitResult(
-                status=EventStatus.REJECTED, event_id=event_id,
-                reason=RejectReason.MISSING_FIELD,
-                detail="死信中不存在该 event_id，无需重投")
+            records = self.storage.load_dead_letters()
+            candidates = [r for r in records
+                          if r.get("event_id") == event_id
+                          and (source is None or r.get("source") == source)]
+            if not candidates:
+                return SubmitResult(
+                    status=EventStatus.REJECTED, event_id=event_id,
+                    reason=RejectReason.MISSING_FIELD,
+                    detail="死信中不存在该 (source, event_id)，无需重投")
+            if len(candidates) > 1:
+                srcs = sorted({str(r.get("source")) for r in candidates})
+                return SubmitResult(
+                    status=EventStatus.REJECTED, event_id=event_id,
+                    reason=RejectReason.DUPLICATE_ID_CONFLICT,
+                    detail=f"event_id={event_id} 在多个来源 {srcs} 均有死信，"
+                           f"请指定 source 后重投")
+            rec = candidates[0]
+            result = self._submit_locked(rec["raw"])
+            if result.status in (EventStatus.ACCEPTED, EventStatus.DUPLICATE):
+                self.storage.remove_dead_letter(
+                    event_id, rec.get("source"))
+            return result
 
     # ------------------------------------------------------------------ #
     # 查询与窗口关闭
@@ -303,6 +356,12 @@ class Pipeline:
     def offsets(self) -> dict[str, int]:
         with self._lock:
             return dict(self._offsets)
+
+    def quota(self) -> dict[str, int | None]:
+        """服务级总闸用量：已受理数 / 上限（0 表示不限）。"""
+        with self._lock:
+            return {"accepted_total": self._total_accepted,
+                    "max_total_events": self.config.max_total_events}
 
     # ------------------------------------------------------------------ #
     # 内部工具
@@ -328,8 +387,12 @@ class Pipeline:
                 self._offsets[event.source] = offset
 
     def _persist_state(self) -> None:
+        # 去重表以显式三元组落盘（JSON 无元组类型），来源与编号各自独立
+        dedup_entries = [[src, eid, sig]
+                         for (src, eid), sig in sorted(self._dedup.items())]
         self.storage.save_state({
-            "dedup": self._dedup,
+            "dedup_v2": dedup_entries,
+            "total_accepted": self._total_accepted,
             "offsets": self._offsets,
             "windows": self.wm.snapshot(),
         })
@@ -338,15 +401,20 @@ class Pipeline:
     def _restore(self) -> None:
         state = self.storage.load_state()
         if state is not None:
-            self._dedup = dict(state.get("dedup", {}))
+            self._dedup = self._load_dedup(state)
             self._offsets = dict(state.get("offsets", {}))
             self.wm.restore(state["windows"])
+            # 总额度优先取快照计数；旧快照无该字段时以去重表条数为准
+            total = state.get("total_accepted")
+            self._total_accepted = int(total) if isinstance(total, int) \
+                else len(self._dedup)
             return
         # 快照缺失时从 WAL 重放（兜底）
         for rec in self.storage.load_wal():
-            event = MarketEvent(**rec["event"])
+            event = self._event_from_dict(rec["event"])
             self.wm.restore_fold(event)
-            self._dedup[event.event_id] = canonical_payload(event)
+            self._dedup[event.key] = canonical_payload(event)
+            self._total_accepted += 1
             offset = rec.get("offset")
             if _is_nonneg_int(offset):
                 prev = self._offsets.get(event.source, -1)
@@ -354,6 +422,30 @@ class Pipeline:
                     self._offsets[event.source] = offset
         if self._dedup:
             self._persist_state()
+
+    @staticmethod
+    def _load_dedup(state: dict) -> dict[tuple[str, str], str]:
+        """读回去重表：支持新版 dedup_v2 三元组与旧版 {event_id: 签名}。"""
+        if "dedup_v2" in state:
+            return {(str(src), str(eid)): str(sig)
+                    for src, eid, sig in state["dedup_v2"]}
+        # 旧版全局 event_id 命名空间：来源未知，统一归入空来源以保持不重不漏
+        return {("", str(eid)): str(sig)
+                for eid, sig in state.get("dedup", {}).items()}
+
+    @staticmethod
+    def _event_from_dict(data: dict) -> MarketEvent:
+        """从 WAL/快照恢复事件：金额归一化为 Decimal，兼容旧版 float。"""
+        return MarketEvent(
+            event_id=str(data["event_id"]),
+            source=str(data["source"]),
+            symbol=str(data["symbol"]),
+            price=_to_decimal(data["price"]),
+            quantity=_to_decimal(data["quantity"]),
+            event_time_ms=int(data["event_time_ms"]),
+            schema_version=int(data.get("schema_version", 1)),
+            venue=str(data.get("venue", "DEFAULT")),
+        )
 
     def close(self) -> None:
         with self._lock:

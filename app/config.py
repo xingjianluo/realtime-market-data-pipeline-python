@@ -10,6 +10,8 @@ class Config:
     max_future_skew_ms: int = 10_000
     max_events_per_window: int = 1000
     max_submit_batch: int = 500
+    # 服务级总闸：跨来源、跨窗口累计已受理事件数上限；0 表示不限制
+    max_total_events: int = 1_000_000
     data_dir: str = "data"
 
 

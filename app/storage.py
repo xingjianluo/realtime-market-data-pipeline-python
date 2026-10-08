@@ -8,14 +8,46 @@
 
 持久化顺序：先写 WAL 并 fsync，再更新内存聚合，最后原子写状态快照，
 保证服务重启后"已确认的事件与聚合状态不重复、不丢失"。
+
+金额字段（Decimal）以**精确十进制 JSON 数字**落盘（不经过 float），
+读回时所有小数还原为 Decimal，杜绝精度漂移；旧版 float 快照/WAL 也可直接读入。
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+
+# dumps 先把 Decimal 标记成带哨兵的字符串；json.dumps 会把哨兵中的控制字符
+# 转义成字面量 \u0000，故按输出态的转义序列匹配并还原为裸 JSON 数字 token，
+# 全程不经过 float。用户数据里即便出现 "\u0000" 文本，反斜杠也会被二次转义，
+# 不可能与该模式混淆。loads 用 parse_float=Decimal 精确还原。
+_DEC_TAG = "\x00DEC\x00"
+_DEC_TAG_OUT = r"\u0000DEC\u0000"
+_DEC_TOKEN_RE = re.compile(r'"' + re.escape(_DEC_TAG_OUT) + r'([0-9.+\-eE]+)"')
+
+
+def dumps(obj: Any) -> str:
+    """JSON 序列化，Decimal 输出为精确数字字面量。"""
+
+    def _default(value: Any) -> Any:
+        if isinstance(value, Decimal):
+            return f"{_DEC_TAG}{value}"
+        if isinstance(value, (set, tuple)):
+            return list(value)
+        raise TypeError(f"不可序列化的类型: {type(value).__name__}")
+
+    text = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=_default)
+    return _DEC_TOKEN_RE.sub(lambda m: m.group(1), text)
+
+
+def loads(text: str) -> Any:
+    """JSON 反序列化，所有小数 token 精确还原为 Decimal。"""
+    return json.loads(text, parse_float=Decimal)
 
 
 def _fsync_dir(path: Path) -> None:
@@ -63,7 +95,7 @@ class LocalStorage:
     # ---- 已确认事件 WAL -------------------------------------------------
     def append_wal(self, record: dict[str, Any]) -> None:
         assert self._wal_f is not None, "storage 尚未 setup"
-        self._wal_f.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        self._wal_f.write(dumps(record))
         self._wal_f.write("\n")
         self._wal_f.flush()
         os.fsync(self._wal_f.fileno())
@@ -77,7 +109,7 @@ class LocalStorage:
             for line in f:
                 line = line.strip()
                 if line:
-                    records.append(json.loads(line))
+                    records.append(loads(line))
         return records
 
     # ---- 聚合状态快照 ----------------------------------------------------
@@ -85,7 +117,7 @@ class LocalStorage:
         path = self.data_dir / self.STATE_NAME
         tmp = self.data_dir / (self.STATE_NAME + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, sort_keys=True)
+            f.write(dumps(state))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -96,14 +128,14 @@ class LocalStorage:
         if not path.exists():
             return None
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            return loads(f.read())
 
     # ---- 消费位点 --------------------------------------------------------
     def save_offsets(self, offsets: dict[str, int]) -> None:
         path = self.data_dir / self.OFFSETS_NAME
         tmp = self.data_dir / (self.OFFSETS_NAME + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(offsets, f, ensure_ascii=False, sort_keys=True)
+            f.write(dumps(offsets))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, path)
@@ -114,12 +146,12 @@ class LocalStorage:
         if not path.exists():
             return {}
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            return loads(f.read())
 
     # ---- 拒绝记录（死信，可重投）----------------------------------------
     def append_dead_letter(self, record: dict[str, Any]) -> None:
         assert self._dead_f is not None, "storage 尚未 setup"
-        self._dead_f.write(json.dumps(record, ensure_ascii=False, sort_keys=True))
+        self._dead_f.write(dumps(record))
         self._dead_f.write("\n")
         self._dead_f.flush()
         os.fsync(self._dead_f.fileno())
@@ -133,18 +165,31 @@ class LocalStorage:
             for line in f:
                 line = line.strip()
                 if line:
-                    records.append(json.loads(line))
+                    records.append(loads(line))
         return records
 
-    def remove_dead_letter(self, event_id: str) -> None:
+    def remove_dead_letter(self, event_id: str,
+                           source: str | None = None) -> None:
+        """按 event_id 删除死信；给定 source 时只删该来源内的条目。
+
+        多来源 event_id 可能撞车，删除必须限定来源作用域，避免误删他源死信。
+        """
         path = self.data_dir / self.DEAD_NAME
         if not path.exists():
             return
-        kept = [r for r in self.load_dead_letters() if r.get("event_id") != event_id]
+
+        def _matches(rec: dict[str, Any]) -> bool:
+            if rec.get("event_id") != event_id:
+                return False
+            if source is None:
+                return True
+            return rec.get("source") == source
+
+        kept = [r for r in self.load_dead_letters() if not _matches(r)]
         tmp = self.data_dir / (self.DEAD_NAME + ".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
             for r in kept:
-                f.write(json.dumps(r, ensure_ascii=False, sort_keys=True))
+                f.write(dumps(r))
                 f.write("\n")
             f.flush()
             os.fsync(f.fileno())

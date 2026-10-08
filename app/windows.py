@@ -7,10 +7,14 @@
   落在允许迟到范围内的乱序事件仍归入其本来的窗口，不静默丢弃；
 - 超过当前时间 max_future_skew_ms 的"未来事件"以 FUTURE_EVENT 拒绝；
 - 单窗事件数达到上限以 WINDOW_FULL 拒绝；
-- 聚合字段的 first/last 按 (事件时间, 事件ID) 决胜，保证乱序下结果一致。
+- 聚合字段的 first/last 按 (事件时间, 来源, 事件ID) 决胜（多来源 event_id
+  可能撞车，故加入 source 保证全局可比较），保证乱序下结果一致；
+- 成交量/成交金额/均价全部使用 Decimal 精确十进制运算，与到达顺序无关。
 """
 
 from __future__ import annotations
+
+from decimal import Decimal
 
 from app.models import MarketEvent, RejectReason, WindowAggregate
 
@@ -92,8 +96,8 @@ class WindowManager:
             agg.min_price = event.price
         if agg.max_price is None or event.price > agg.max_price:
             agg.max_price = event.price
-        # first/last 以 (事件时间, 事件ID) 确定性决胜，与到达顺序无关
-        key = (event.event_time_ms, event.event_id)
+        # first/last 以 (事件时间, 来源, 事件ID) 确定性决胜，与到达顺序无关
+        key = (event.event_time_ms, event.source, event.event_id)
         if agg.first_key is None or key < agg.first_key:
             agg.first_price = event.price
             agg.first_key = key
@@ -168,19 +172,37 @@ class WindowManager:
                 window_start_ms=w["window_start_ms"],
                 window_end_ms=w["window_end_ms"],
                 count=w["count"],
-                total_quantity=w["total_quantity"],
-                notional=w["notional"],
-                min_price=w["min_price"],
-                max_price=w["max_price"],
-                first_price=w["first_price"],
-                last_price=w["last_price"],
+                total_quantity=_D(w["total_quantity"]),
+                notional=_D(w["notional"]),
+                min_price=_D(w["min_price"]),
+                max_price=_D(w["max_price"]),
+                first_price=_D(w["first_price"]),
+                last_price=_D(w["last_price"]),
                 event_ids=list(w["event_ids"]),
                 sources=set(w["sources"]),
                 closed=w["closed"],
             )
-            fk = w.get("first_key")
-            lk = w.get("last_key")
-            agg.first_key = tuple(fk) if fk else None
-            agg.last_key = tuple(lk) if lk else None
+            agg.first_key = _key(w.get("first_key"))
+            agg.last_key = _key(w.get("last_key"))
             symbol, start = w["_key"]
             self._windows[(symbol, start)] = agg
+
+
+def _D(value: object) -> Decimal | None:
+    """把快照/WAL 中的金额字段归一化为 Decimal；兼容旧版 float/int/字符串。"""
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    # 经 str 走十进制字面量，绝不从二进制 float 直接构造
+    return Decimal(str(value))
+
+
+def _key(value: object) -> tuple[int, str, str] | None:
+    """恢复 first/last 决胜键：兼容旧版 (time, event_id) 二元组。"""
+    if not value:
+        return None
+    if len(value) == 3:
+        return (int(value[0]), str(value[1]), str(value[2]))
+    # 旧快照没有 source 分量，统一归入空来源命名空间
+    return (int(value[0]), "", str(value[1]))
